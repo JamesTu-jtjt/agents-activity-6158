@@ -51,6 +51,7 @@ _load_dotenv()
 @dataclasses.dataclass
 class RunState:
     best_score: float | None = None
+    best_rank: tuple | None = None
     last_score: float | None = None
     best_step: int | None = None
     last_evaluation: dict | None = None
@@ -59,6 +60,8 @@ class RunState:
     repeated_actions: int = 0
     last_action: str | None = None
     model_calls: int = 0
+    phase: str = "grounding"
+    edit_attempts: int = 0
 
 
 STATE = RunState()
@@ -191,20 +194,24 @@ Important known requirements (still verify them in the oracle): strict parsing
 requires major.minor.patch; numeric prerelease identifiers reject leading zero,
 build identifiers may contain leading zero; build metadata is ignored by
 precedence; numeric prerelease identifiers sort below text; shorter equal
-prefixes sort first. The assignment's bump_major/minor/patch functions are the
+prefixes sort first. Numeric prerelease identifiers can be longer than u64, so
+compare them without bounded-integer parsing. The assignment's bump functions are the
 corresponding Version methods in reference/version.py, not next_version.
 
-Use evaluate after the code builds and tests pass. Treat its structured result
-as the reward signal, but do not tune only to seed 0. A task is complete only
-at 100% differential correctness, a passing precedence chain and cargo tests,
-and zero quality violations. If an edit regresses, the harness restores the
-best validated library. Do not merely announce completion: prove it with the
-evaluate tool."""
+Every write_rust or replace_rust action automatically triggers a deterministic
+transaction: release build, Rust tests, differential evaluation on five local
+seeds, quality checks, and best-revision rollback. You do not need to request
+those steps. Use the returned validation evidence to diagnose the next edit.
+
+A task is complete only at 100% differential correctness on every local seed,
+a passing precedence chain and cargo tests, and zero quality violations. The
+harness—not your confidence—decides completion. Prefer source-grounded edits
+over narration, repeated inspection, or speculative rewrites."""
 
 
 def _compact_tool_content(message: dict) -> str:
     content = message.get("content", "")
-    limit = 7000 if message.get("name") in {"read_rust", "evaluate"} else 3500
+    limit = 12000 if message.get("name") in {"read_rust", "write_rust", "replace_rust"} else 3500
     if len(content) <= limit:
         return content
     return content[:limit] + f"\n...[{len(content) - limit} characters omitted]"
@@ -222,10 +229,13 @@ def build_context(history: list[dict], step: int) -> list[dict]:
         "step": step,
         "model_calls": STATE.model_calls,
         "best_score": STATE.best_score,
+        "best_rank": STATE.best_rank,
         "last_score": STATE.last_score,
         "best_step": STATE.best_step,
         "evaluations_without_improvement": STATE.evaluations_without_improvement,
         "last_evaluation": STATE.last_evaluation,
+        "phase": STATE.phase,
+        "edit_attempts": STATE.edit_attempts,
     }
     selected = copy.deepcopy(history[2:][-12:])
     digest = []
@@ -280,6 +290,7 @@ def should_stop(
         last_score == 100.0
         and result.get("cargo_tests_failed") == 0
         and result.get("spec_precedence_chain") is True
+        and (result.get("adversarial_holdout") or {}).get("passed") is True
         and not result.get("violations")
     ):
         return True, "validated success: 100% differential, tests pass, clean quality"
@@ -384,9 +395,10 @@ def t_probe(args: dict) -> str:
     allowed = ("parse ", "compare ", "bump ", "format ")
     if any(not isinstance(command, str) or not command.startswith(allowed) for command in commands):
         return "error: unsupported harness command"
+    build = _run(["cargo", "build", "--release"], cwd=RUST)
+    if not build["ok"]:
+        return json.dumps({"error": "current library does not build", "build": build}, indent=2)
     binary = RUST / "target" / "release" / "harness"
-    if not binary.exists():
-        return "error: release harness missing; run cargo_build first"
     try:
         proc = subprocess.run(
             [str(binary)],
@@ -423,11 +435,134 @@ def _evaluation_summary(report: dict) -> dict:
     }
 
 
+def _evaluation_rank(summary: dict) -> tuple:
+    """Rank candidates by rule compliance first, then behavioral strength."""
+    quality = summary.get("quality") or {}
+    clean = not summary.get("violations")
+    tests_clean = summary.get("cargo_tests_failed") == 0
+    quality_debt = sum(
+        quality.get(name, 0)
+        for name in ("clone_calls", "to_owned_calls", "unwrap_calls")
+    )
+    return (
+        int(bool(clean)),
+        int(bool(tests_clean)),
+        int(bool((summary.get("adversarial_holdout") or {}).get("passed"))),
+        int(bool(summary.get("spec_precedence_chain"))),
+        float(summary.get("differential_pct") or 0.0),
+        int(summary.get("cargo_tests_passed") or 0),
+        -quality_debt,
+    )
+
+
+def _adversarial_holdout() -> dict:
+    """Check deterministic edge cases absent from the random case generator."""
+    import semver
+
+    valid = [
+        "18446744073709551615.0.0",
+        "1.0.0-999999999999999999999999999999999999999",
+        "1.0.0-1000000000000000000000000000000000000000+00001",
+        "1.0.0-A.0-a+000.---",
+        "0.0.0-0",
+    ]
+    invalid = [
+        "1.0.0-00",
+        "1.0.0-000000000000000000000000000000000000001",
+        "1.0.0-α",
+        "１.0.0",
+        "1.0.0+a..b",
+    ]
+    pairs = [
+        (
+            "1.0.0-999999999999999999999999999999999999999",
+            "1.0.0-1000000000000000000000000000000000000000",
+        ),
+        ("1.0.0+build.1", "1.0.0+build.999"),
+        ("1.0.0-A", "1.0.0-a"),
+        ("1.0.0-1", "1.0.0-a"),
+        ("1.0.0-a", "1.0.0-a.0"),
+    ]
+    bumps = [
+        ("major", "18446744073709551614.9.9-rc.1+build"),
+        ("minor", "7.8.9-rc.1+build"),
+        ("patch", "7.8.9-rc.1+build"),
+    ]
+    commands = [f"parse {value}" for value in valid]
+    commands += [f"parse {value}" for value in invalid]
+    commands += [f"compare {left} {right}" for left, right in pairs]
+    commands += [f"bump {kind} {value}" for kind, value in bumps]
+    commands += [f"format {value}" for value in valid]
+
+    binary = RUST / "target" / "release" / "harness"
+    try:
+        proc = subprocess.run(
+            [str(binary)],
+            input="\n".join(commands) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return {"passed": False, "pass": 0, "total": len(commands), "failures": ["timeout"]}
+    lines = proc.stdout.splitlines()
+    if proc.returncode != 0 or len(lines) != len(commands):
+        return {
+            "passed": False,
+            "pass": 0,
+            "total": len(commands),
+            "failures": [f"harness returned {len(lines)} responses: {proc.stderr[:500]}"],
+        }
+    got = [json.loads(line) for line in lines]
+    expected = []
+    for value in valid:
+        version = semver.Version.parse(value)
+        expected.append(
+            {
+                "ok": True,
+                "major": version.major,
+                "minor": version.minor,
+                "patch": version.patch,
+                "prerelease": version.prerelease,
+                "build": version.build,
+            }
+        )
+    expected.extend({"ok": False} for _ in invalid)
+    expected.extend(
+        {"ok": True, "cmp": semver.Version.parse(left).compare(right)}
+        for left, right in pairs
+    )
+    expected.extend(
+        {
+            "ok": True,
+            "version": str(getattr(semver.Version.parse(value), f"bump_{kind}")()),
+        }
+        for kind, value in bumps
+    )
+    expected.extend({"ok": True, "version": value} for value in valid)
+
+    failures = []
+    passed = 0
+    for command, actual, wanted in zip(commands, got, expected):
+        matches = all(actual.get(key) == value for key, value in wanted.items())
+        if matches:
+            passed += 1
+        elif len(failures) < 8:
+            failures.append(f"{command}: got {actual}, expected {wanted}")
+    return {
+        "passed": passed == len(commands),
+        "pass": passed,
+        "total": len(commands),
+        "failures": failures,
+    }
+
+
 def t_evaluate(_args: dict) -> str:
-    """Evaluate three local seeds and preserve or restore the best library."""
+    """Evaluate five local seeds and preserve or restore the best library."""
     STATE_DIR.mkdir(exist_ok=True)
     per_seed = []
-    for seed in (0, 17, 271):
+    captured_diagnostics = False
+    for seed in (0, 17, 271, 9999, 65537):
         with tempfile.NamedTemporaryFile(suffix=".json", dir=STATE_DIR, delete=False) as tmp:
             report_path = pathlib.Path(tmp.name)
         try:
@@ -438,7 +573,7 @@ def t_evaluate(_args: dict) -> str:
                     "--seed",
                     str(seed),
                     "--n",
-                    "120",
+                    "300",
                     "--json",
                     str(report_path),
                 ],
@@ -450,8 +585,9 @@ def t_evaluate(_args: dict) -> str:
             one = _evaluation_summary(json.loads(report_path.read_text()))
             one["seed"] = seed
             marker = "First failures:"
-            if marker in run["output"]:
+            if marker in run["output"] and not captured_diagnostics:
                 one["first_failures"] = run["output"].split(marker, 1)[1].strip()[:5000]
+                captured_diagnostics = True
             per_seed.append(one)
         finally:
             report_path.unlink(missing_ok=True)
@@ -473,11 +609,15 @@ def t_evaluate(_args: dict) -> str:
         ),
         "runs": per_seed,
     }
+    summary["adversarial_holdout"] = _adversarial_holdout()
     STATE.last_score = score
     STATE.last_evaluation = summary
-    improved = score is not None and (STATE.best_score is None or score > STATE.best_score)
+    rank = _evaluation_rank(summary)
+    summary["candidate_rank"] = rank
+    improved = score is not None and (STATE.best_rank is None or rank > STATE.best_rank)
     if improved:
         STATE.best_score = score
+        STATE.best_rank = rank
         STATE.best_step = STATE.model_calls
         STATE.evaluations_without_improvement = 0
         shutil.copyfile(LIB, BEST_LIB)
@@ -487,7 +627,7 @@ def t_evaluate(_args: dict) -> str:
         if (
             score is not None
             and STATE.best_score is not None
-            and score < STATE.best_score
+            and rank < STATE.best_rank
             and BEST_LIB.exists()
         ):
             shutil.copyfile(BEST_LIB, LIB)
@@ -495,7 +635,44 @@ def t_evaluate(_args: dict) -> str:
         else:
             summary["best_revision"] = "unchanged"
     summary["best_score"] = STATE.best_score
+    summary["best_rank"] = STATE.best_rank
     return json.dumps(summary, indent=2)
+
+
+def _validate_after_edit() -> str:
+    """Deterministically gate a stochastic edit and roll back unsafe states."""
+    STATE.phase = "validating"
+    STATE.edit_attempts += 1
+    build = _run(["cargo", "build", "--release"], cwd=RUST)
+    if not build["ok"]:
+        restored = _restore_best_if_needed()
+        STATE.phase = "diagnose"
+        return json.dumps(
+            {"stage": "build", "build": build, "restored_best": restored}, indent=2
+        )
+
+    tests = _run(["cargo", "test", "--release"], cwd=RUST)
+    if not tests["ok"]:
+        restored = _restore_best_if_needed()
+        STATE.phase = "diagnose"
+        return json.dumps(
+            {"stage": "tests", "build": build, "tests": tests, "restored_best": restored},
+            indent=2,
+        )
+
+    evaluation = json.loads(t_evaluate({}))
+    successful = (
+        evaluation.get("differential_pct") == 100.0
+        and evaluation.get("cargo_tests_failed") == 0
+        and evaluation.get("spec_precedence_chain") is True
+        and (evaluation.get("adversarial_holdout") or {}).get("passed") is True
+        and not evaluation.get("violations")
+    )
+    STATE.phase = "complete" if successful else "diagnose"
+    return json.dumps(
+        {"stage": "evaluation", "build": build, "tests": tests, "evaluation": evaluation},
+        indent=2,
+    )
 
 
 def _empty_schema() -> dict:
@@ -535,7 +712,7 @@ TOOLS = [
     dict(name="read_rust", description="Read rust/src/lib.rs.", parameters=_empty_schema(), fn=t_read_rust),
     dict(
         name="write_rust",
-        description="Overwrite lib.rs. Use for an initial implementation or coherent full rewrite.",
+        description="Overwrite lib.rs, then automatically build, test, evaluate five seeds, and roll back regressions. Use for the initial implementation or a coherent full rewrite.",
         parameters={
             "type": "object",
             "required": ["content"],
@@ -546,7 +723,7 @@ TOOLS = [
     ),
     dict(
         name="replace_rust",
-        description="Replace one exact, uniquely occurring fragment in lib.rs.",
+        description="Replace one exact fragment in lib.rs, then automatically build, test, evaluate five seeds, and roll back regressions.",
         parameters={
             "type": "object",
             "required": ["old", "new"],
@@ -555,11 +732,9 @@ TOOLS = [
         },
         fn=t_replace_rust,
     ),
-    dict(name="cargo_build", description="Build the release harness.", parameters=_empty_schema(), fn=t_cargo_build),
-    dict(name="cargo_test", description="Run Rust unit tests in release mode.", parameters=_empty_schema(), fn=t_cargo_test),
     dict(
         name="probe",
-        description="Run 1-30 focused harness commands: parse, compare, bump, or format.",
+        description="Build current code and run 1-30 focused harness commands: parse, compare, bump, or format.",
         parameters={
             "type": "object",
             "required": ["commands"],
@@ -568,15 +743,17 @@ TOOLS = [
         },
         fn=t_probe,
     ),
-    dict(
-        name="evaluate",
-        description="Run structured evaluation on local seeds 0, 17, and 271; preserve best and roll back regressions.",
-        parameters=_empty_schema(),
-        fn=t_evaluate,
-    ),
 ]
 BY_NAME = {tool["name"]: tool for tool in TOOLS}
 SCHEMAS = [{key: tool[key] for key in ("name", "description", "parameters")} for tool in TOOLS]
+
+
+def _schemas_for_phase() -> list[dict]:
+    """Expose only tools relevant to the current state to reduce routing noise."""
+    if STATE.phase == "grounding":
+        allowed = {"read_source", "search_source", "read_rust", "write_rust"}
+        return [schema for schema in SCHEMAS if schema["name"] in allowed]
+    return SCHEMAS
 
 
 def _restore_best_if_needed() -> bool:
@@ -627,12 +804,19 @@ def main() -> int:
         step += 1
         STATE.model_calls = step
         try:
-            reply = call_model(build_context(history, step), SCHEMAS)
+            active_schemas = _schemas_for_phase()
+            reply = call_model(build_context(history, step), active_schemas)
         except Exception as exc:
             stop_reason = f"model error: {exc}"
             rec(event="model_error", step=step, error=str(exc))
             break
-        rec(event="model", step=step, reply=reply)
+        rec(
+            event="model",
+            step=step,
+            phase=STATE.phase,
+            available_tools=[schema["name"] for schema in active_schemas],
+            reply=reply,
+        )
 
         if reply.get("text"):
             print(f"[{step}] {reply['text'][:200]}")
@@ -671,6 +855,16 @@ def main() -> int:
                     output = tool["fn"](call.get("arguments") or {})
                 except Exception as exc:
                     output = f"tool error ({type(exc).__name__}): {exc}"
+            name = call.get("name")
+            if name in {"write_rust", "replace_rust"} and not str(output).startswith(
+                ("error:", "tool error")
+            ):
+                validation = _validate_after_edit()
+                output = f"{output}\n\nAUTOMATIC VALIDATION:\n{validation}"
+            elif name in {"read_rust", "probe"}:
+                STATE.phase = "diagnose"
+            elif name in {"read_source", "search_source"} and STATE.edit_attempts == 0:
+                STATE.phase = "grounding"
             print(f"      -> {call.get('name')}: {str(output).splitlines()[0][:120]}")
             rec(
                 event="tool",
