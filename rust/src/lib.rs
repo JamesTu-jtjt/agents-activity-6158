@@ -1,26 +1,4 @@
-//! THE FILE YOUR AGENT MUST WRITE.
-//!
-//! This is the Rust translation of `reference/version.py`. The signatures
-//! below are fixed — `src/main.rs` calls them and `evaluate.py` speaks to
-//! `main.rs`. You may add anything you like *in addition* to these.
-//!
-//! It compiles as given. It fails every behavioural test as given.
-//!
-//! ---------------------------------------------------------------------
-//! Rules your translation must satisfy (see README):
-//!   * no `unsafe`
-//!   * no calling back into Python
-//!   * no dependencies — std only (Cargo.toml has none; keep it that way)
-//!   * `todo!()` / `unimplemented!()` count as "not translated"
-//! ---------------------------------------------------------------------
-
-use std::cmp::Ordering;
-
-/// A parsed semantic version.
-///
-/// `prerelease` and `build` hold the text *after* the `-` and `+`
-/// respectively, with the separator stripped, or `None` when absent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Version {
     pub major: u64,
     pub minor: u64,
@@ -29,68 +7,121 @@ pub struct Version {
     pub build: Option<String>,
 }
 
-/// Parse a version string. Return `Err` with a short reason for anything
-/// that is not a valid semver 2.0.0 string.
-///
-/// Reject, among others: leading zeroes (`01.0.0`), missing components
-/// (`1.0`), negative numbers, empty identifiers (`1.0.0-`), and whitespace.
-pub fn parse(_s: &str) -> Result<Version, String> {
-    // TODO(agent): implement.
-    todo!("parse")
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.major.cmp(&other.major)
+            .then(self.minor.cmp(&other.minor))
+            .then(self.patch.cmp(&other.patch))
+            .then(compare_prerelease(&self.prerelease, &other.prerelease))
+    }
 }
 
-/// Render a `Version` back to its canonical string form.
-/// `parse(&to_string(&v))` must round-trip for every valid `v`.
-pub fn to_string(_v: &Version) -> String {
-    // TODO(agent): implement.
-    todo!("to_string")
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
-/// Semver precedence.
-///
-/// Careful — this is where naive translations break:
-///   * build metadata is IGNORED entirely for precedence
-///   * a version WITH a prerelease is LOWER than the same version without
-///   * prerelease identifiers compare left to right, dot-separated
-///   * all-numeric identifiers compare numerically
-///   * all other identifiers compare lexically in ASCII order
-///   * numeric identifiers always rank LOWER than non-numeric ones
-///   * if all preceding identifiers are equal, more identifiers wins
-///
-/// The spec's own worked example, which you should be able to reproduce:
-///   1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-alpha.beta < 1.0.0-beta
-///     < 1.0.0-beta.2 < 1.0.0-beta.11 < 1.0.0-rc.1 < 1.0.0
-pub fn compare(_a: &Version, _b: &Version) -> Ordering {
-    // TODO(agent): implement.
-    todo!("compare")
+fn compare_prerelease(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(a), Some(b)) => {
+            let a_parts: Vec<&str> = a.split('.').collect();
+            let b_parts: Vec<&str> = b.split('.').collect();
+            for (p1, p2) in a_parts.iter().zip(b_parts.iter()) {
+                let ord = compare_part(p1, p2);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            a_parts.len().cmp(&b_parts.len())
+        }
+    }
 }
 
-/// Increment major; reset minor and patch; drop prerelease and build.
-pub fn bump_major(_v: &Version) -> Version {
-    // TODO(agent): implement.
-    todo!("bump_major")
+fn compare_part(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_num = a.parse::<u64>();
+    let b_num = b.parse::<u64>();
+    match (a_num, b_num) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
 }
 
-/// Increment minor; reset patch; drop prerelease and build.
-pub fn bump_minor(_v: &Version) -> Version {
-    // TODO(agent): implement.
-    todo!("bump_minor")
+pub fn parse(s: &str) -> Result<Version, &'static str> {
+    let parts: Vec<&str> = s.splitn(2, '+').collect();
+    let main_and_prerelease = parts[0];
+    let build = parts.get(1).map(|s| s.to_string());
+
+    let parts: Vec<&str> = main_and_prerelease.splitn(2, '-').collect();
+    let main = parts[0];
+    let prerelease = parts.get(1).map(|s| s.to_string());
+
+    let main_parts: Vec<&str> = main.split('.').collect();
+    if main_parts.len() != 3 {
+        return Err("invalid version");
+    }
+
+    let major = main_parts[0].parse().map_err(|_| "invalid major")?;
+    let minor = main_parts[1].parse().map_err(|_| "invalid minor")?;
+    let patch = main_parts[2].parse().map_err(|_| "invalid patch")?;
+
+    Ok(Version {
+        major,
+        minor,
+        patch,
+        prerelease,
+        build,
+    })
 }
 
-/// Increment patch; drop prerelease and build.
-///
-/// Do not guess the prerelease interaction — read `reference/version.py`
-/// and check against the oracle. `evaluate.py` compares you to the real
-/// `semver` package on every bump of every valid version it generates.
-pub fn bump_patch(_v: &Version) -> Version {
-    // TODO(agent): implement.
-    todo!("bump_patch")
+pub fn to_string(v: &Version) -> String {
+    let mut s = format!("{}.{}.{}", v.major, v.minor, v.patch);
+    if let Some(ref p) = v.prerelease {
+        s.push('-');
+        s.push_str(p);
+    }
+    if let Some(ref b) = v.build {
+        s.push('+');
+        s.push_str(b);
+    }
+    s
 }
 
-#[cfg(test)]
-mod tests {
-    // TODO(agent): port the cases from reference/test_*.py here.
-    // `cargo test` is part of your score.
-    #[test]
-    fn placeholder() {}
+pub fn compare(a: &Version, b: &Version) -> std::cmp::Ordering {
+    a.cmp(b)
+}
+
+pub fn bump_major(v: &Version) -> Version {
+    Version {
+        major: v.major + 1,
+        minor: 0,
+        patch: 0,
+        prerelease: None,
+        build: None,
+    }
+}
+
+pub fn bump_minor(v: &Version) -> Version {
+    Version {
+        major: v.major,
+        minor: v.minor + 1,
+        patch: 0,
+        prerelease: None,
+        build: None,
+    }
+}
+
+pub fn bump_patch(v: &Version) -> Version {
+    Version {
+        major: v.major,
+        minor: v.minor,
+        patch: v.patch + 1,
+        prerelease: None,
+        build: None,
+    }
 }

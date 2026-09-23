@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import pathlib
+import random
 import re
 import shutil
 import subprocess
@@ -26,6 +27,8 @@ LOGS = HERE / "logs"
 STATE_DIR = HERE / ".agent"
 BEST_LIB = STATE_DIR / "best-lib.rs"
 MAX_MODEL_CALLS = 40
+RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
+_LAST_API_REQUEST_AT: float | None = None
 
 
 def _load_dotenv(path: pathlib.Path = HERE / ".env") -> None:
@@ -123,8 +126,49 @@ def _provider_config() -> tuple[str, str, str, str]:
     )
 
 
+def _retry_after_seconds(exc: urllib.error.HTTPError, detail: str) -> float | None:
+    """Extract a provider-supplied retry delay from headers or a JSON error."""
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            pass
+
+    try:
+        payload = json.loads(detail)
+    except json.JSONDecodeError:
+        payload = {}
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    details = error.get("details", []) if isinstance(error, dict) else []
+    if not isinstance(details, list):
+        details = []
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        delay = item.get("retryDelay")
+        if isinstance(delay, str):
+            match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)s", delay)
+            if match:
+                return float(match.group(1))
+
+    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", detail, re.IGNORECASE)
+    return float(match.group(1)) if match else None
+
+
+def _pace_api_request() -> None:
+    """Keep sequential calls below the configured requests-per-minute ceiling."""
+    global _LAST_API_REQUEST_AT
+    interval = max(0.0, float(os.environ.get("AGENT_MIN_REQUEST_INTERVAL", "13")))
+    if _LAST_API_REQUEST_AT is not None:
+        remaining = interval - (time.monotonic() - _LAST_API_REQUEST_AT)
+        if remaining > 0:
+            time.sleep(remaining)
+    _LAST_API_REQUEST_AT = time.monotonic()
+
+
 def call_model(messages: list[dict], tools: list[dict]) -> dict:
-    """Call Gemini or OpenAI directly and normalize its function-call reply."""
+    """Call the configured model, retry transients, and normalize its reply."""
     provider, api_key, model, base_url = _provider_config()
     body = {
         "model": model,
@@ -142,14 +186,38 @@ def call_model(messages: list[dict], tools: list[dict]) -> dict:
         method="POST",
     )
     timeout = int(os.environ.get("AGENT_TIMEOUT", "180"))
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:2000]
-        raise RuntimeError(f"model API HTTP {exc.code}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"model API request failed: {exc}") from exc
+    max_retries = max(0, int(os.environ.get("AGENT_MAX_RETRIES", "6")))
+    for attempt in range(max_retries + 1):
+        _pace_api_request()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.load(response)
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:2000]
+            if exc.code not in RETRYABLE_HTTP_STATUS or attempt == max_retries:
+                raise RuntimeError(f"model API HTTP {exc.code}: {detail}") from exc
+            provider_delay = _retry_after_seconds(exc, detail)
+            backoff = min(60.0, 2.0**attempt)
+            delay = max(backoff, provider_delay or 0.0)
+            delay += random.uniform(0.0, min(1.0, delay * 0.2))
+            print(
+                f"[retry] model API HTTP {exc.code}; retrying in {delay:.1f}s "
+                f"({attempt + 1}/{max_retries})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt == max_retries:
+                raise RuntimeError(f"model API request failed: {exc}") from exc
+            delay = min(60.0, 2.0**attempt)
+            delay += random.uniform(0.0, min(1.0, delay * 0.2))
+            print(
+                f"[retry] model API request failed; retrying in {delay:.1f}s "
+                f"({attempt + 1}/{max_retries})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
     try:
         message = payload["choices"][0]["message"]
