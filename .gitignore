@@ -2,3 +2,7 @@ rust/target/
 logs/*.jsonl
 __pycache__/
 *.pyc
+.agent/
+.env
+.env.*
+!.env.example
