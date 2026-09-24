@@ -20,7 +20,7 @@ flowchart TD
 
     C --> D{"Harness phase"}
 
-    D -- Grounding --> E["Gemini receives compact context<br/>and only 4 relevant tools"]
+    D -- Grounding --> E["Gemini receives compact context<br/>and phase-scoped tools"]
     E --> F{"Selected action"}
 
     F -- Inspect --> G["Read/search Python source and tests<br/>or inspect current Rust"]
@@ -67,6 +67,11 @@ flowchart TD
   coupled, so one agent is used instead of adding multi-agent coordination risk.
 - **Phase-scoped tools:** The grounding phase exposes only inspection and initial
   implementation tools. Diagnostic tools become available after an edit.
+- **Front-loaded first turn:** The first call receives the exact Rust stub plus a
+  compact, verified SemVer behavior packet and only the full-file write tool.
+  Source inspection reopens after that attempt if validation finds a problem.
+  This preserves source-grounded recovery while avoiding repeated browsing
+  before the first implementation.
 - **Bounded context:** Each call receives a state ledger and compact recent-action
   digest rather than the complete trajectory or repeated full-file versions.
 - **Independent validation:** Five deterministic seeds at `n=300` are combined
