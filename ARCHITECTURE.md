@@ -1,5 +1,14 @@
 # Agent Architecture
 
+## At a glance
+
+The agent is a single-model translation loop wrapped in a deterministic safety
+harness. Gemini inspects bounded slices of the Python reference and proposes
+Rust edits; the harness builds, tests, evaluates, and quality-checks every edit,
+keeps only the best validated revision, and rolls back regressions. A compact
+state ledger, explicit stop conditions, a 40-call ceiling, and JSONL event logs
+keep the process bounded and auditable.
+
 The agent uses a stochastic model for source-grounded code edits and a
 deterministic harness for every acceptance decision. Predictable operations are
 implemented in code rather than delegated to the model.
